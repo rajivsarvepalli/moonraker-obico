@@ -20,9 +20,6 @@ from .utils import DEBUG, run_in_thread
 from .ws import WebSocketClient, WebSocketConnectionException
 from .version import VERSION
 
-REQUEST_STATE_INTERVAL_SECONDS = 30
-if DEBUG:
-    REQUEST_STATE_INTERVAL_SECONDS = 10
 
 _logger = logging.getLogger('obico.moonraker_conn')
 _ignore_pattern=re.compile(r'"method": "notify_proc_stat_update"')
@@ -47,11 +44,11 @@ class MoonrakerConn:
         self.shutdown: bool = False
         self.conn = None
         self.ws_message_queue_to_moonraker = queue.Queue(maxsize=16)
-        self.moonraker_state_requested_ts = 0
         self.request_callbacks = OrderedDict()
         self.request_callbacks_lock = threading.RLock()   # Because OrderedDict is not thread-safe
         self.available_printer_objects = []
         self.remote_event_handlers = {}
+        self._last_set_macro_variables_call = None
 
     def block_until_klippy_ready(self):
         run_in_thread(self._start)
@@ -77,7 +74,7 @@ class MoonrakerConn:
 
         while self.shutdown is False:
             try:
-                if self.klippy_ready.wait() and self.moonraker_state_requested_ts < time.time() - REQUEST_STATE_INTERVAL_SECONDS:
+                if self.klippy_ready.wait():
                     self.request_status_update()
 
             except Exception as e:
@@ -160,6 +157,9 @@ class MoonrakerConn:
         data = self.api_get('server/database/item', raise_for_status=False, namespace='mainsail', key='presets') or {}
         for preset in data.get('value', {}).get('presets', {}).values():
             try:
+                if 'gcode' in preset and preset['gcode'].strip():
+                    continue  # We don't support presets using gcode for now to keep things simple
+
                 preset_name = preset['name']
                 extruder_target = float(preset['values']['extruder']['value'])
                 bed_target = float(preset['values']['heater_bed']['value'])
@@ -180,20 +180,31 @@ class MoonrakerConn:
         data = self.api_get('server/history/list', raise_for_status=True, order='desc', limit=1)
         return (data.get('jobs', [None]) or [None])[0]
 
-    def set_macro_variable(self, macro_name, var_name, var_value):
-        script = f'SET_GCODE_VARIABLE MACRO={macro_name} VARIABLE={var_name} VALUE={var_value}'
-        _logger.debug(script)
-        try:
-            resp = self.api_post(
-                'printer/gcode/script',
-                raise_for_status=True,
-                script=script
-            )
-        except:
-            _logger.warning(f'set_macro_variable failed! - SET_GCODE_VARIABLE MACRO={macro_name} VARIABLE={var_name} VALUE={var_value}')
-
     def macro_is_configured(self, macro_name):
         return any(f'gcode_macro {macro_name.lower()}' in item.lower() for item in self.available_printer_objects)
+
+    def set_macro_variables(self, macro_name, **kwargs):
+        current_call = (macro_name, tuple(kwargs.items()))
+        if self._last_set_macro_variables_call == current_call:
+            return
+
+        if not self.macro_is_configured(macro_name):
+            _logger.warning(f'{macro_name} not configured as a macro. Check your printer.cfg file.')
+            return
+
+        for var_name, var_value in kwargs.items():
+            script = f'SET_GCODE_VARIABLE MACRO={macro_name} VARIABLE={var_name} VALUE={var_value}'
+            _logger.debug(script)
+            try:
+                resp = self.api_post(
+                    'printer/gcode/script',
+                    raise_for_status=True,
+                    script=script
+                )
+                self._last_set_macro_variables_call = current_call
+            except:
+                _logger.warning(f'set_macro_variable failed! - SET_GCODE_VARIABLE MACRO={macro_name} VARIABLE={var_name} VALUE={var_value}')
+
 
     ## WebSocket part
 
@@ -217,7 +228,6 @@ class MoonrakerConn:
                 return
 
             data = json.loads(raw)
-            _logger.debug(f'Received from Moonraker: {data}')
 
             callback = None
 
@@ -231,6 +241,7 @@ class MoonrakerConn:
                 callback(data)
                 return
 
+            _logger.debug(f'Received from Moonraker: {data}')
             if  data.get('method', '') == 'obico_remote_event':
                 event_name = data.get('params', {}).get('event_name')
                 handler = self.remote_event_handlers.get(event_name)
@@ -263,7 +274,6 @@ class MoonrakerConn:
                         self.klippy_ready.wait()
                         _logger.info('Klippy ready')
 
-                _logger.debug("Sending to Moonraker: \n{}".format(data))
                 self.conn.send(json.dumps(data, default=str))
             except WebSocketConnectionException as e:
                 _logger.warning(e)
@@ -281,7 +291,7 @@ class MoonrakerConn:
         if not self.conn:
             self.conn.close()
 
-    def jsonrpc_request(self, method, params=None, callback=None):
+    def jsonrpc_request(self, method, params=None, callback=None, log_for_debug=True):
         next_id = randrange(100000)
         payload = {
             "jsonrpc": "2.0",
@@ -299,6 +309,8 @@ class MoonrakerConn:
                 self.request_callbacks[next_id] = callback
 
         try:
+            if log_for_debug:
+                _logger.debug(f'Sending to Moonraker: {payload}')
             self.ws_message_queue_to_moonraker.put_nowait(payload)
         except queue.Full:
             _logger.warning("Moonraker message queue is full, msg dropped")
@@ -329,8 +341,6 @@ class MoonrakerConn:
                 Event(sender=self.id, name='status_update', data=data)
             )
 
-        self.moonraker_state_requested_ts = time.time()
-
         if objects is None:
             objects = {
                 "webhooks": None,
@@ -348,7 +358,12 @@ class MoonrakerConn:
             for heater in (self.app_config.all_mr_heaters()):
                 objects[heater] = None
 
-        self.jsonrpc_request('printer.objects.query', params=dict(objects=objects), callback=status_update_callback)
+        self.jsonrpc_request(
+            'printer.objects.query',
+            params=dict(objects=objects),
+            callback=status_update_callback,
+            log_for_debug=False, # Skip logging for routine status update because it's too verbose
+        )
 
     def request_jog(self, axes_dict: Dict[str, Number], is_relative: bool, feedrate: int) -> Dict:
         # TODO check axes
@@ -371,9 +386,14 @@ class MoonrakerConn:
 
     def request_home(self, axes) -> Dict:
         # TODO check axes
-        script = "G28 %s" % " ".join(
-            map(lambda x: "%s0" % x.upper(), axes)
-        )
+
+        if axes == ['x', 'y', 'z']:
+            script = "G28"
+        else:
+            script = "G28 %s" % " ".join(
+                map(lambda x: "%s0" % x.upper(), axes)
+            )
+
         return self.jsonrpc_request('printer.gcode.script', params=dict(script=script))
 
     def request_set_temperature(self, heater, target_temp) -> Dict:

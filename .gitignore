@@ -7,5 +7,5 @@ build
 dist
 *.egg*
 .DS_Store
-moonraker-obico.cfg
+test_cfgs
 venv

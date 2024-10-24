@@ -15,9 +15,10 @@ from flask import request, jsonify
 from werkzeug.serving import make_server
 import argparse
 from queue import Queue
+import backoff
 
 from .version import VERSION
-from .utils import raise_for_status, run_in_thread, verify_link_code, wait_for_port
+from .utils import raise_for_status, run_in_thread, verify_link_code
 from .config import Config
 from .moonraker_conn import MoonrakerConn
 
@@ -44,14 +45,13 @@ class StubMoonrakerConn:
     The only purpose of this.moonrakerconn is to set the OBICO_LINK_STATUS macro variables.
 
     This class is a stub for that purpose so that during situations like linking from console, the plugin doesn't crash.
-    The only function sacrificed is set_macro_variable.
+    The only function sacrificed is set_macro_variables.
     """
-    def macro_is_configured(self, macro_name):
-        return False
 
-    def set_macro_variable(self, macro_name, variable_name, value):
-        pass
-
+    def __getattr__(self, name):
+        def method(*args, **kwargs):
+            _logger.debug(f"Stubbing {name} call")
+        return method
 
 class PrinterDiscovery(object):
 
@@ -64,7 +64,6 @@ class PrinterDiscovery(object):
 
         # One time passcode to share between the plugin and the server
         self.one_time_passcode = ''
-        self.one_time_passcode_lock = Lock()    # Make sure it's thread safe
 
         # The states for auto discovery handshake
         # device_id is different every time plugin starts
@@ -77,8 +76,7 @@ class PrinterDiscovery(object):
         _logger.info(
             'printer_discovery started, device_id: {}'.format(self.device_id))
 
-        if self.moonrakerconn.macro_is_configured('OBICO_LINK_STATUS'):
-            self.moonrakerconn.set_macro_variable('OBICO_LINK_STATUS', 'is_linked', False)
+        self.set_obico_link_status(False, '', '')
 
         try:
             self._start(total_steps)
@@ -89,16 +87,18 @@ class PrinterDiscovery(object):
         _logger.debug('printer_discovery quits')
 
     def get_one_time_passcode(self):
-        with self.one_time_passcode_lock:
-            return self.one_time_passcode
+        return self.one_time_passcode
 
-    def set_one_time_passcode(self, code, passlink):
-        with self.one_time_passcode_lock:
-            self.one_time_passcode = code
+    def set_one_time_passcode(self, code):
+        self.one_time_passcode = code
 
-        if self.moonrakerconn.macro_is_configured('OBICO_LINK_STATUS'):
-            self.moonrakerconn.set_macro_variable('OBICO_LINK_STATUS', 'one_time_passcode', f'\'"{code}"\'') # f'\'"{code}"\'' because of https://github.com/Klipper3d/klipper/issues/4816#issuecomment-950109507
-            self.moonrakerconn.set_macro_variable('OBICO_LINK_STATUS', 'one_time_passlink', f'\'"{passlink}"\'')
+    def set_obico_link_status(self, is_linked, one_time_passcode, one_time_passlink):
+        self.moonrakerconn.set_macro_variables('OBICO_LINK_STATUS',
+            is_linked=is_linked,
+            one_time_passcode=f'\'"{one_time_passcode}"\'', # f'\'"{code}"\'' because of https://github.com/Klipper3d/klipper/issues/4816#issuecomment-950109507
+            one_time_passlink=f'\'"{one_time_passlink}"\''
+        )
+
 
     def _start(self, steps_remaining):
         self.device_secret = token_hex(32)
@@ -169,6 +169,7 @@ class PrinterDiscovery(object):
         except Exception:
             pass
 
+    @backoff.on_exception(backoff.expo, Exception, max_value=120)
     def announce_unlinked_status(self):
         data = self._collect_device_info()
 
@@ -209,18 +210,21 @@ class PrinterDiscovery(object):
     # Return: True: one time passcode has a match and verified
     def _process_one_time_passcode_response(self, data):
         if 'one_time_passcode' not in data or 'verification_code' not in data:
-            # _logger.warning('No one_time_passcode or verification_code in response. Maybe old server version?')
+            _logger.warning('No one_time_passcode or verification_code in response. Maybe old server version?')
             return False
 
         verification_code = data['verification_code']
         if verification_code != '': # Server tells us we got a match for one time passcode
             verify_link_code(self.config, verification_code)
-            self.set_one_time_passcode('', '')
+            self.set_one_time_passcode('')
+            self.set_obico_link_status(True, '', '')
             return True
 
         new_one_time_passcode = data['one_time_passcode']
         if self.get_one_time_passcode() != new_one_time_passcode:
-            self.set_one_time_passcode(new_one_time_passcode, data['one_time_passlink'])
+            self.set_one_time_passcode(new_one_time_passcode)
+
+        self.set_obico_link_status(False, new_one_time_passcode, data['one_time_passlink'])
 
         return False
 
@@ -299,7 +303,7 @@ class PrinterDiscovery(object):
                 'secret' not in msg['data'] or
                 msg['data']['secret'] != self.device_secret
             ):
-                _logger.error('printer_discovery got unmatching secret')
+                _logger.warning('printer_discovery got unmatching secret')
                 self.sentry.captureMessage(
                     'printer_discovery got unmatching secret',
                     extra={'secret': self.device_secret, 'msg': msg}
@@ -308,7 +312,7 @@ class PrinterDiscovery(object):
                 return
 
             if msg['device_id'] != self.device_id:
-                _logger.error('printer_discovery got unmatching device_id')
+                _logger.warning('printer_discovery got unmatching device_id')
                 self.sentry.captureMessage(
                     'printer_discovery got unmatching device_id',
                     extra={'device_id': self.device_id, 'msg': msg}
@@ -319,7 +323,7 @@ class PrinterDiscovery(object):
             code = msg['data']['code']
             verify_link_code(self.config, code)
         else:
-            _logger.error('printer_discovery got unexpected message')
+            _logger.warning('printer_discovery got unexpected message. Dropping it.')
 
         self.stop()
         return
@@ -370,7 +374,7 @@ def is_local_address(address):
         ip = netaddr.IPAddress(address)
         return ip.is_private() or ip.is_loopback()
     except Exception as exc:
-        _logger.error(
+        _logger.warning(
             'could not determine whether {} is local address ({})'.format(
                 address, exc)
         )

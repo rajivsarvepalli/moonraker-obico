@@ -56,8 +56,6 @@ class Panel(ScreenPanel):
         logging.info('activate')
 
         gcode_macros = self._printer.get_gcode_macros()
-        gcode_macros_lower = [macro.lower() for macro in gcode_macros]
-
         if OBICO_LINK_STATUS_MACRO not in [macro.upper() for macro in gcode_macros]:
             self.display_setup_guide_qr_code()
 
@@ -118,7 +116,7 @@ class Panel(ScreenPanel):
         self.qr_code_label.set_markup(f"<big><b>Scan to Set Up Obico</b></big>")
         self.reset_action_container()
 
-        self.update_qr_code('https://obico.io/docs/user-guides/klipper-screen-setup/')
+        self.update_qr_code('https://obico.io/docs/user-guides/klipper-setup/')
 
         self.default_bottom_text()
 
@@ -127,15 +125,19 @@ class Panel(ScreenPanel):
         qr = qrcode.QRCode(
             version=1,
             error_correction=qrcode.constants.ERROR_CORRECT_L,
-            box_size=10,
-            border=4,
+            box_size=4,
+            border=2,
         )
         qr.add_data(link_url)
         qr.make(fit=True)
 
         img = qr.make_image(fill_color="black", back_color="white")
         img_byte_arr = BytesIO()
-        img.save(img_byte_arr, format='PNG')
+        try:
+            img.save(img_byte_arr, format='PNG')
+        except Exception:
+            img.save(img_byte_arr)  # Sometimes qrcode doesn't return a PILImage. In that case, save it without format
+
         img_byte_arr = img_byte_arr.getvalue()
 
         # Load the QR code image into a GdkPixbuf

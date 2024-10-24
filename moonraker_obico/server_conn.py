@@ -2,19 +2,23 @@ from typing import Optional, Dict, List, Tuple
 import requests  # type: ignore
 import logging
 import time
-import backoff
 import queue
 import bson
 import json
 from collections import deque
+import backoff
+from urllib.error import URLError, HTTPError
 
-from .utils import ExpoBackoff
+from .utils import ExpoBackoff, DEBUG, run_in_thread
 from .ws import WebSocketClient, WebSocketConnectionException
 from .config import Config
 from .printer import PrinterState
 from .webcam_capture import capture_jpeg
 from .lib import curlify
 
+NON_CRITICAL_UPDATE_INTERVAL_SECONDS = 30
+if DEBUG:
+    NON_CRITICAL_UPDATE_INTERVAL_SECONDS = 5
 
 _logger = logging.getLogger('obico.server_conn')
 
@@ -42,11 +46,11 @@ class ServerConn:
                 self.ss = None
 
             if close_status_code == 4321:
-                _logger.error('Shared auth_token detected. Shutting down.')
+                _logger.warning('Shared auth_token detected. Shutting down.')
                 self.should_reconnect = False
 
         def on_server_ws_open(ws):
-            self.post_status_update_to_server(with_config=True) # Make sure an update is sent asap so that the server can rely on the availability of essential info such as agent.version
+            self.post_status_update_to_server(with_settings=True) # Make sure an update is sent asap so that the server can rely on the availability of essential info such as agent.version
 
         def on_message(ws, msg):
             try:
@@ -93,8 +97,12 @@ class ServerConn:
         except queue.Full:
             _logger.warning("Server message queue is full, msg dropped")
 
-    def post_status_update_to_server(self, print_event: Optional[str] = None, with_config: Optional[bool] = False):
-        self.send_ws_msg_to_server(self.printer_state.to_dict(print_event=print_event, with_config=with_config))
+    def post_status_update_to_server(self, print_event: Optional[str] = None, with_settings: Optional[bool] = False, is_critical=True):
+        # Throttle the non-critical updates to the server to reduce the server load
+        if not (print_event or with_settings or is_critical) and self.status_posted_to_server_ts > time.time() - NON_CRITICAL_UPDATE_INTERVAL_SECONDS:
+            return
+
+        self.send_ws_msg_to_server(self.printer_state.to_dict(print_event=print_event, with_settings=with_settings))
         self.status_posted_to_server_ts = time.time()
 
 
@@ -119,12 +127,31 @@ class ServerConn:
         files = None
         if attach_snapshot:
             try:
-                files = {'snapshot': capture_jpeg(self)}
+                files = {'snapshot': capture_jpeg(self.config.primary_webcam_config)}
             except Exception as e:
                 _logger.warn('Failed to capture jpeg - ' + str(e))
                 pass
         resp = self.send_http_request('POST', '/api/v1/octo/printer_events/', timeout=60, raise_exception=True, files=files, data=event_data)
 
+    def post_pic_to_server(self, webcam_config, viewing_boost=False):
+        if not webcam_config:
+            _logger.warn('webcam_config is None. Skipping jpeg posting to server. Ill-configured [webcam] section?')
+            return
+
+        try:
+            files = {'pic': capture_jpeg(webcam_config)}
+
+            data = dict(
+                is_primary_camera=webcam_config.is_primary_camera,
+                is_nozzle_camera=webcam_config.is_nozzle_camera,
+                camera_name=webcam_config.name,
+                viewing_boost=viewing_boost
+            )
+            resp = self.send_http_request('POST', '/api/v1/octo/pic/', timeout=60, files=files, data=data, raise_exception=True, skip_debug_logging=True)
+            _logger.debug('Jpeg posted to server - camera name: {} - viewing_boost: {} - {}'.format(webcam_config.name, viewing_boost, resp))
+        except (URLError, HTTPError, requests.exceptions.RequestException, ValueError) as e:
+            _logger.warn('Failed to capture jpeg - ' + str(e))
+            return
 
     def send_http_request(self, method, uri, timeout=10, raise_exception=True, skip_debug_logging=False, **kwargs):
         endpoint = self.config.server.canonical_endpoint_prefix() + uri

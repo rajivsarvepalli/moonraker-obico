@@ -66,9 +66,20 @@ class TunnelConfig:
 @dataclasses.dataclass
 class WebcamConfig:
 
-    def __init__(self, webcam_config_section):
+    def __init__(self, webcam_config_section, is_primary_camera):
+        self.is_primary_camera = is_primary_camera
         self.webcam_config_section = webcam_config_section
         self.moonraker_webcam_config = {}
+
+        self.name = self.webcam_config_section.name[len("webcam "):] # '' for default webcam config, in which case we will try to fetch the config from Moonraker
+        self.resolution = self.webcam_config_section.get('resolution')
+        self.stream_mode = self.webcam_config_section.get('stream_mode')
+        self.h264_http_url = self.webcam_config_section.get('h264_http_url')
+        self.h264_device_path = self.webcam_config_section.get('h264_device_path')
+
+    @property
+    def is_nozzle_camera(self):
+        return self.webcam_config_section.getboolean('is_nozzle_camera', False)
 
     @property
     def snapshot_url(self):
@@ -95,16 +106,17 @@ class WebcamConfig:
             _logger.warn(f'Invalid disable_video_streaming value. Using default.')
             return False
 
-    def get_target_fps(self, fallback_fps=25):
-        try:
-            fps = float( self.webcam_config_section.get('target_fps'))
-        except:
-            fps = fallback_fps
-        return min(fps, 30)
-
     @property
-    def snapshot_ssl_validation(self):
-        return False
+    def target_fps(self):
+        fps = 25
+
+        if self.moonraker_webcam_config:
+            fps = int(self.moonraker_webcam_config.get('target_fps', 15))
+
+        if self.webcam_config_section:
+            fps = int(self.webcam_config_section.get('target_fps', 25))
+
+        return min(fps, 30)
 
     @property
     def stream_url(self):
@@ -112,32 +124,43 @@ class WebcamConfig:
 
     @property
     def flip_h(self):
-        if 'flip_h' in self.webcam_config_section:
-            try:
-                return self.webcam_config_section.getboolean('flip_h')
-            except:
-                _logger.warn(f'Invalid flip_h value. Using default.')
+        flip = False
 
-        return self.moonraker_webcam_config.get('flip_h')
+        if self.moonraker_webcam_config:
+            flip = self.moonraker_webcam_config.get('flip_h', False)
+
+        if self.webcam_config_section and self.webcam_config_section.getboolean('flip_h') is not None:
+            flip = self.webcam_config_section.getboolean('flip_h')
+
+        return flip
 
     @property
     def flip_v(self):
-        if 'flip_v' in self.webcam_config_section:
-            try:
-                return self.webcam_config_section.getboolean('flip_v')
-            except:
-                _logger.warn(f'Invalid flip_v value. Using default.')
+        flip = False
 
-        return self.moonraker_webcam_config.get('flip_v')
+        if self.moonraker_webcam_config:
+            flip = self.moonraker_webcam_config.get('flip_v', False)
+
+        if self.webcam_config_section and self.webcam_config_section.getboolean('flip_v') is not None:
+            flip = self.webcam_config_section.getboolean('flip_v')
+
+        return flip
 
     @property
     def rotation(self):
         invalid_value_message = f'Invalid rotation value. Valid values: [0, 90, 180, 270]. Using default.'
+        rotation = 0
         try:
-            rotation = self.webcam_config_section.getint('rotation', 0)
+            if self.moonraker_webcam_config:
+                rotation = self.moonraker_webcam_config.get('rotation', 0)
+
+            if self.webcam_config_section and self.webcam_config_section.getint('rotation') is not None:
+                rotation = self.webcam_config_section.getint('rotation')
+
             if not rotation in [0, 90, 180, 270]:
                 _logger.warn(invalid_value_message)
                 return 0
+
             return rotation
         except:
             _logger.warn(invalid_value_message)
@@ -151,6 +174,7 @@ class WebcamConfig:
             _logger.warn(f'Invalid aspect_ratio_169 value. Using default.')
             return False
 
+
     @classmethod
     def webcam_full_url(cls, url):
         if not url or not url.strip():
@@ -163,10 +187,16 @@ class WebcamConfig:
         return full_url
 
 
+    def __repr__(self):
+        attributes = ', '.join(f'{k}={getattr(self, k)}' for k in dir(self) if not k.startswith('__') and not callable(getattr(self, k)))
+        return f"WebcamConfig({attributes})"
+
+
 @dataclasses.dataclass
 class LoggingConfig:
     path: str
-    level: str = 'DEBUG'
+    level: str = 'INFO'
+    log_network: bool = False
 
 
 class Config:
@@ -238,7 +268,18 @@ class Config:
             url_blacklist=[],
         )
 
-        self.webcam = WebcamConfig(webcam_config_section=config['webcam'])
+        self.webcams = []
+        webcam_sections = [section for section in config.sections() if section.startswith("webcam")]
+        if len(webcam_sections) == 0:
+            _logger.warn('No webcam configs found. Creating default config.')
+            self._config.add_section('webcam')
+            self.write()
+            webcam_sections = [section for section in config.sections() if section.startswith("webcam")]
+
+        is_primary_camera = True # First webcam is primary
+        for section in webcam_sections:
+            self.webcams.append(WebcamConfig(webcam_config_section=config[section], is_primary_camera=is_primary_camera))
+            is_primary_camera = False
 
         self.logging = LoggingConfig(
             path=config.get(
@@ -248,6 +289,10 @@ class Config:
             level=config.get(
                 'logging', 'level',
                 fallback=''
+            ),
+            log_network=config.getboolean(
+                'logging', 'log_network',
+                fallback=False
             ),
 		)
 
@@ -263,23 +308,27 @@ class Config:
         else:
             return {}
 
-
     def write(self) -> None:
         with open(self._config_path, 'w') as f:
             self._config.write(f)
 
+    @property
+    def primary_webcam_config(self):
+        if len(self.webcams) > 0:
+            return self.webcams[0]
+        else:
+            return None
+
     def update_server_auth_token(self, auth_token: str):
+        if 'server' not in self._config:
+            self._config.add_section('server')
+
         self.server.auth_token = auth_token
         self._config.set('server', 'auth_token', auth_token)
         self.write()
 
-
     def get_mapped_server_heater_name(self, mr_heater_name):
         return self.moonraker_objects['heater_mapping'].get(mr_heater_name)
-
-    def get_mapped_mr_heater_name(self, server_heater_name):
-        mr_heater_name = list(self.moonraker_objects['heater_mapping'].keys())[list(self.moonraker_objects['heater_mapping'].values()).index(server_heater_name)]
-        return mr_heater_name
 
     def all_mr_heaters(self):
          return self.moonraker_objects['heater_mapping'].keys()
@@ -300,11 +349,13 @@ class Config:
             if result and len(result.get('webcams', [])) > 0:  # Apparently some Moonraker versions support this endpoint but mistakenly returns an empty list even when webcams are present
                 _logger.debug(f'Found config in Moonraker webcams API: {result}')
                 webcam_configs = [ dict(
+                            name = cfg.get('name', None),
                             snapshot_url = cfg.get('snapshot_url', None),
                             stream_url = cfg.get('stream_url', None),
                             flip_h = cfg.get('flip_horizontal', False),
                             flip_v = cfg.get('flip_vertical', False),
                             rotation = cfg.get('rotation', 0),
+                            target_fps = cfg.get('target_fps', 15),
                          ) for cfg in result.get('webcams', []) if 'mjpeg' in cfg.get('service', '').lower() ]
 
                 if len(webcam_configs) > 0:
@@ -312,11 +363,13 @@ class Config:
 
                 # In case of WebRTC webcam
                 webcam_configs = [ dict(
+                            name = cfg.get('name', None),
                             snapshot_url = cfg.get('snapshot_url', None),
                             stream_url = cfg.get('snapshot_url', '').replace('action=snapshot', 'action=stream'), # TODO: Webrtc stream_url is not compatible with MJPEG stream url. Let's guess it. it is a little hacky.
                             flip_h = cfg.get('flip_horizontal', False),
                             flip_v = cfg.get('flip_vertical', False),
                             rotation = cfg.get('rotation', 0),
+                            target_fps = cfg.get('target_fps', 15),
                          ) for cfg in result.get('webcams', []) if 'webrtc' in cfg.get('service', '').lower() ]
                 return  webcam_configs
 
@@ -325,11 +378,13 @@ class Config:
             if result:
                 _logger.debug(f'Found config in Moonraker webcams namespace: {result}')
                 return [ dict(
+                            name = cfg.get('name', None),
                             snapshot_url = cfg.get('urlSnapshot', None),
                             stream_url = cfg.get('urlStream', None),
                             flip_h = cfg.get('flipX', False),
                             flip_v = cfg.get('flipY', False),
-                            rotation = cfg.get('rotation', 0), # TODO Verify the key name for rotation
+                            rotation = cfg.get('rotation', 0),
+                            target_fps = cfg.get('targetFps', 15),
                         ) for cfg in result.get('value', {}).values() if 'mjpeg' in cfg.get('service', '').lower() ]
 
             # webcam configs not found in the standard location. Try fluidd's flavor
@@ -337,27 +392,33 @@ class Config:
             if result:
                 _logger.debug(f'Found config in Moonraker fluidd/cameras namespace: {result}')
                 return [ dict(
+                            name = cfg.get('name', None),
                             stream_url = cfg.get('url', None),
                             flip_h = cfg.get('flipX', False),
                             flip_v = cfg.get('flipY', False),
-                            rotation = cfg.get('rotation', 0), # TODO Verify the key name for rotation
+                            rotation = cfg.get('rotate', 0),
+                            target_fps = cfg.get('fpstarget', 15),
                         ) for cfg in result.get('value', {}).get('cameras', []) if cfg.get('enabled', False) ]
 
-            #TODO: Send notification to user that webcam configs not found when moonraker's announcement api makes to stable
             return []
 
         mr_webcam_config = webcams_configured_in_moonraker()
 
-        if len(mr_webcam_config) > 0:
-            _logger.debug(f'Retrieved webcam config from Moonraker: {mr_webcam_config[0]}')
-            self.webcam.moonraker_webcam_config = mr_webcam_config[0]
+        # Add all webcam urls to the blacklist so that they won't be tunnelled
+        url_list = [[ cfg.get('snapshot_url', None), cfg.get('stream_url', None) ] for cfg in mr_webcam_config ]
+        self.tunnel.url_blacklist = [url for url in reduce(concat, url_list, []) if url]
 
-            # Add all webcam urls to the blacklist so that they won't be tunnelled
-            url_list = [[ cfg.get('snapshot_url', None), cfg.get('stream_url', None) ] for cfg in mr_webcam_config ]
-            self.tunnel.url_blacklist = [ url for url in reduce(concat, url_list) if url ]
+        if len(self.webcams) == 1 and self.webcams[0].name == '':   # Only default webcam config is present
+             if len(mr_webcam_config) > 0:
+                _logger.debug(f'Retrieved webcam config from Moonraker: {mr_webcam_config[0]}')
+                self.webcams[0].moonraker_webcam_config = mr_webcam_config[0]
         else:
-            #TODO: Send notification to user that webcam configs not found when moonraker's announcement api makes to stable
-            pass
+            for webcam in self.webcams:
+                for cfg in mr_webcam_config:
+                    if cfg.get('name', None) == webcam.name:
+                        _logger.debug(f'Found a matching webcam config from Moonraker: {cfg}')
+                        webcam.moonraker_webcam_config = cfg
+
 
     # Adopted from getHeaters, getTemperatureObjects, getTemperatureSensors in mainsail:/src/store/printer/getters.ts
     def update_heater_mapping(self, moonraker_conn):

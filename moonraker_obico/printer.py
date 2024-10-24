@@ -28,7 +28,7 @@ class PrinterState:
 
     ACTIVE_STATES = [STATE_PRINTING, STATE_PAUSED]
 
-    def __init__(self, app_config: Config, plugin):
+    def __init__(self, app_config: Config):
         self._mutex = threading.RLock()
         self.app_config = app_config
         self.status = {}
@@ -38,10 +38,15 @@ class PrinterState:
         self.thermal_presets = []
         self.installed_plugins = []
         self.current_file_metadata = None
-        self.plugin = plugin
+        self.webcams = None
+        self.data_channel_id = None
 
     def has_active_job(self) -> bool:
         return PrinterState.get_state_from_status(self.status) in PrinterState.ACTIVE_STATES
+
+    def is_busy(self) -> bool:
+        with self._mutex:
+            return self.status.get('print_stats', {}).get('state') in ['printing', 'paused']
 
     def is_printing(self) -> bool:
         with self._mutex:
@@ -76,6 +81,11 @@ class PrinterState:
         with self._mutex:
             return self.obico_g_code_file_id
 
+    def set_webcams(self, webcams, data_channel_id):
+        with self._mutex:
+            self.webcams = webcams
+            self.data_channel_id = data_channel_id
+
     @classmethod
     def get_state_from_status(cls, data: Dict) -> str:
         klippy_state = data.get(
@@ -96,7 +106,7 @@ class PrinterState:
         }.get(data.get('print_stats', {}).get('state', 'unknown'), PrinterState.STATE_OFFLINE)
 
     def to_dict(
-        self, print_event: Optional[str] = None, with_config: Optional[bool] = False
+        self, print_event: Optional[str] = None, with_settings: Optional[bool] = False
     ) -> Dict:
         with self._mutex:
             data = {
@@ -107,15 +117,10 @@ class PrinterState:
             if print_event:
                 data['event'] = {'event_type': print_event}
 
-            if with_config:
-                config = self.app_config
+            if with_settings:
                 data["settings"] = dict(
-                    webcam=dict(
-                        flipV=config.webcam.flip_v,
-                        flipH=config.webcam.flip_h,
-                        rotation=config.webcam.rotation,
-                        streamRatio="16:9" if config.webcam.aspect_ratio_169 else "4:3",
-                    ),
+                    webcams=self.webcams,
+                    data_channel_id=self.data_channel_id,
                     temperature=dict(dict(profiles=self.thermal_presets)),
                     agent=dict(
                         name="moonraker_obico",
@@ -193,10 +198,10 @@ class PrinterState:
                     'user': None,
                 },
                 'progress': {
-                    'completion': completion * 100,
+                    'completion': completion * 100 if completion is not None else None,
                     'filepos': virtual_sdcard.get('file_position', 0),
-                    'printTime': print_time,
-                    'printTimeLeft': print_time_left,
+                    'printTime': print_time if print_time is not None else None,
+                    'printTimeLeft': print_time_left if print_time_left is not None else None,
                     'filamentUsed': print_stats.get('filament_used')
                 },
                 'temperatures': temps,
@@ -224,7 +229,7 @@ class PrinterState:
         print_stats = self.status.get('print_stats') or dict()
         print_info = print_stats.get('info') or dict()
         file_metadata = self.current_file_metadata
-        is_not_printing = self.is_printing() is False or self.transient_state is not None
+        is_not_busy = self.is_busy() is False or self.transient_state is not None
         has_print_duration = print_stats.get('print_duration', 0) > 0
 
         current_z = None
@@ -262,7 +267,7 @@ class PrinterState:
                 current_layer = max(current_layer, 0) # Apparently the previous calculation can result in negative number in some cases...
 
         if max_z and current_z > max_z: current_z = 0 # prevent buggy looking flicker on print start
-        if current_layer is None or total_layers is None or is_not_printing or not has_print_duration: # edge case handling - if either are not available we show nothing / show nothing if paused state, transient, etc / show nothing if no print duration (prevents tracking z height during preheat & start bytes)
+        if current_layer is None or total_layers is None or is_not_busy or not has_print_duration: # edge case handling - if either are not available we show nothing / show nothing if paused state, transient, etc / show nothing if no print duration (prevents tracking z height during preheat & start bytes)
             current_layer = None
             total_layers = None
 

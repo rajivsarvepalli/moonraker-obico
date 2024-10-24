@@ -1,4 +1,5 @@
 import logging
+import collections
 import requests
 import os
 import sys
@@ -10,10 +11,53 @@ import pathlib
 from .utils import sanitize_filename
 from .state_transition import call_func_with_state_transition
 
-_logger = logging.getLogger('obico.file_downloader')
+_logger = logging.getLogger('obico.passthru')
 
 MAX_GCODE_DOWNLOAD_SECONDS = 10 * 60
 
+
+class PassthruExecutor:
+
+    def __init__(self, passthru_targets, server_conn, sentry):
+        self.passthru_targets = passthru_targets
+        self.server_conn = server_conn
+        self.sentry = sentry
+
+        self.seen_refs = collections.deque(maxlen=100)
+
+    def run(self, passthru_msg):
+        _logger.debug(f'Received passthru from server: {passthru_msg}')
+
+        passthru = passthru_msg['passthru']
+        ack_ref = passthru.get('ref')
+        if ack_ref is not None:
+            # same msg may arrive through both ws and datachannel
+            if ack_ref in self.seen_refs:
+                _logger.debug('Ignoring already processed passthru message')
+                return
+            self.seen_refs.append(ack_ref)
+
+        error = None
+        try:
+            target = self.passthru_targets.get(passthru.get('target'))
+            func = getattr(target, passthru['func'], None)
+            ret_value, error = func(*(passthru.get("args", [])), **(passthru.get("kwargs", {})))
+        except (AttributeError, TypeError):
+            error = 'Request not supported. Please make sure moonraker-obico is updated to the latest version. If moonraker-obico is already up to date and you still see this error, please contact Obico support at support@obico.io'
+        except Exception as e:
+            error = str(e)
+            self.sentry.captureException()
+
+        if ack_ref is not None:
+            if error:
+                resp = {'ref': ack_ref, 'error': error}
+            else:
+                resp = {'ref': ack_ref, 'ret': ret_value}
+
+            self.server_conn.send_ws_msg_to_server({'passthru': resp})
+
+
+### Below are individual passthru target
 
 class FileDownloader:
 
@@ -65,7 +109,7 @@ class FileDownloader:
                 raise
 
 
-        if self.model.printer_state.is_printing():
+        if self.model.printer_state.is_busy():
             return None, 'Printer busy!'
 
         call_func_with_state_transition(self.server_conn, self.model.printer_state, self.model.printer_state.STATE_GCODE_DOWNLOADING, _download_and_print, MAX_GCODE_DOWNLOAD_SECONDS)
@@ -125,8 +169,7 @@ class Printer:
         if not self.moonrakerconn:
             return None, 'Printer is not connected!'
 
-        mr_heater = self.model.config.get_mapped_mr_heater_name(heater)
-        self.moonrakerconn.request_set_temperature(heater=mr_heater, target_temp=target_temp)
+        self.moonrakerconn.request_set_temperature(heater=heater, target_temp=target_temp)
         return None, None
 
 
@@ -160,7 +203,7 @@ class MoonrakerApi:
             try:
                 # Wrap requests.exceptions.RequestException in Exception, since it's one of the configured errors_to_ignore
                 try:
-                    ret_value = api_func(self.func, **kwargs)
+                    ret_value = api_func(self.func, timeout=30, **kwargs)
                 except requests.exceptions.RequestException as exc:
                     if (self.func == "printer/gcode/script"):
                         raise Exception(' "{}" - "{}"'.format(self.func, kwargs.get('script', '')[:5])) from exc # Take first 5 characters of the scrips to see if Sentry grouping will behave more friendly
@@ -193,7 +236,7 @@ class FileOperations:
     def start_printer_local_print(self, file_to_print):
         if not self.moonrakerconn:
             return None, 'Printer is not connected!'
-        
+
         ret_value = None
         error = None
         filepath = file_to_print['url']
